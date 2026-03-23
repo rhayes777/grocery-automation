@@ -935,7 +935,7 @@ def ocado_search(args: argparse.Namespace, query: str, *, headed: bool = False) 
     ensure_ocado_open(args, headed=headed)
     load_ocado_storage_state_if_present(args)
     accept_ocado_cookies_if_present(args)
-    snapshot = snapshot_path_for_session(args, OCADO_SESSION)
+    snapshot, _ = load_ocado_home_snapshot(args, headed=headed)
     text = parse_snapshot_text(snapshot)
     search_ref, button_ref = search_controls_from_snapshot(text)
     run_playwright_or_exit(
@@ -948,7 +948,10 @@ def ocado_search(args: argparse.Namespace, query: str, *, headed: bool = False) 
         capture_output=True,
         echo=False,
     )
-    search_snapshot = latest_snapshot_path_from_output(output)
+    if "[Snapshot](" in output:
+        search_snapshot = latest_snapshot_path_from_output(output)
+    else:
+        search_snapshot = snapshot_path_for_session(args, OCADO_SESSION)
     results = parse_ocado_search_results(parse_snapshot_text(search_snapshot))
     if not results:
         raise SystemExit(f"No Ocado add-to-trolley results found for query {query!r}.")

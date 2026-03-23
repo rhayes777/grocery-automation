@@ -70,4 +70,5 @@ grocery-shopping sainsburys slot-book <slot_id> --confirm
 ## Notes
 
 - `orders` and `favourites` may be retailer-specific and best-effort. Verify current live behavior before promising them.
+- Serialize repeated Ocado browser actions against one session. Parallel search/add commands can race the page state and make snapshots unreliable.
 - If a command that used to work starts failing, switch to the self-healing skill instead of guessing selectors.
