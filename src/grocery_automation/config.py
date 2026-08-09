@@ -35,6 +35,10 @@ def default_output_dir() -> Path:
     return app_home() / "playwright"
 
 
+def default_worker_dir() -> Path:
+    return app_home() / "worker"
+
+
 def default_calendar_name() -> str:
     return os.environ.get("WEEKLY_SHOP_CALENDAR", "Primary")
 

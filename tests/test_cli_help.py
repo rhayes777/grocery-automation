@@ -26,6 +26,7 @@ def test_grocery_help():
     assert result.returncode == 0
     assert "sainsburys" in result.stdout
     assert "ocado" in result.stdout
+    assert "worker" in result.stdout
 
 
 def test_weekly_help():
