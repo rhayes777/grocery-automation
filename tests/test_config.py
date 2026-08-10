@@ -14,6 +14,7 @@ def test_default_paths_live_under_app_home(monkeypatch):
     assert config.default_state_path().parent == app_home
     assert config.default_data_dir().parent == app_home
     assert config.default_output_dir().parent == app_home
+    assert config.default_worker_dir().parent == app_home
 
 
 def test_grocery_cli_command_uses_module_by_default(monkeypatch):

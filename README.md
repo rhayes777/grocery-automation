@@ -16,9 +16,9 @@ Support is retailer- and flow-specific. Keep the support table honest and re-val
 | Flow | Ocado | Sainsbury's |
 | --- | --- | --- |
 | Login / session reuse | validated | validated |
-| Search | validated but flaky in one smoke run | validated |
-| Add to basket | implemented | validated |
-| Basket summary | flaky in one smoke run | validated |
+| Search | validated | validated |
+| Add to basket | validated | validated |
+| Basket summary | validated | validated |
 | Checkout state | validated | validated |
 | Slots listing | validated | validated |
 | Slot booking | implemented; re-test before relying on it | validated |
@@ -39,7 +39,19 @@ This creates a virtual environment, installs the package in editable mode, and a
 
 ### Browser Automation Prerequisite
 
-The CLIs expect a Playwright-compatible command runner. They resolve it in this order:
+The package now supports two browser execution paths:
+
+- default: a long-lived Python Playwright worker for the hot interactive flows
+- fallback: the existing `playwright-cli` runner for flows that still use the older wrapper path
+
+Install a browser for the Python worker path:
+
+```bash
+. .venv/bin/activate
+python -m playwright install chromium
+```
+
+The fallback CLI path resolves the Playwright-compatible command in this order:
 
 1. `GROCERY_PLAYWRIGHT_CLI`
 2. `playwright-cli` on `PATH`
@@ -57,6 +69,7 @@ By default the package stores local state under:
 Useful environment variables:
 
 - `GROCERY_AUTOMATION_HOME`: override the entire local app-data directory
+- `GROCERY_WORKER_DIR`: override the worker runtime directory
 - `GROCERY_PLAYWRIGHT_CLI`: override the Playwright command
 - `GROCERY_SHOPPING_BIN`: override how `weekly-shop` calls `grocery-shopping`
 - `WEEKLY_SHOP_GCALCLI`: path to `gcalcli`
@@ -82,6 +95,8 @@ Check sessions:
 ```bash
 grocery-shopping ocado session-status
 grocery-shopping sainsburys session-status
+grocery-shopping worker start
+grocery-shopping worker status
 ```
 
 Search and inspect baskets:
@@ -116,12 +131,22 @@ weekly-shop regular-items --retailer ocado
 weekly-shop open-checkout --retailer sainsburys
 ```
 
+Stop the long-lived worker when you want to clear warm browser state:
+
+```bash
+grocery-shopping worker stop
+```
+
 ## Skills
 
 The repo includes public Codex-oriented skills:
 
 - `skills/grocery-shopping/SKILL.md`
 - `skills/weekly-shop/SKILL.md`
+- `skills/add-shopping-list/SKILL.md`
+- `skills/add-regulars/SKILL.md`
+- `skills/add-recipe/SKILL.md`
+- `skills/look-up-and-add-recipe/SKILL.md`
 - `skills/extend-supermarket/SKILL.md`
 - `skills/self-heal-grocery-cli/SKILL.md`
 

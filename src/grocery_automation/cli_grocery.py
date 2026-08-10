@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from grocery_automation.config import default_data_dir, default_output_dir, default_state_path, resolve_pwcli
+from grocery_automation.playwright_worker import (
+    WorkerUnavailable,
+    ensure_worker_running,
+    request_worker,
+    worker_socket_path,
+)
 
 DEFAULT_STATE = default_state_path()
 DEFAULT_DATA_DIR = default_data_dir()
@@ -295,6 +301,148 @@ def retailer_page_url(retailer: str, page: str) -> str:
 def storage_state_path(state: dict[str, Any], retailer: str) -> Path:
     entry = retailer_state(state, retailer)
     return Path(entry["storage_state"])
+
+
+def worker_status_payload() -> dict[str, Any]:
+    try:
+        result = request_worker("status", timeout=1.0)
+    except WorkerUnavailable:
+        return {
+            "running": False,
+            "socket": str(worker_socket_path()),
+            "sessions": [],
+        }
+    if not isinstance(result, dict):
+        raise WorkerUnavailable("Unexpected worker status payload.")
+    result["running"] = True
+    return result
+
+
+def stop_worker() -> dict[str, Any]:
+    try:
+        result = request_worker("stop", timeout=1.0)
+    except WorkerUnavailable:
+        return {"stopping": False, "sessions": []}
+    if not isinstance(result, dict):
+        raise WorkerUnavailable("Unexpected worker stop payload.")
+    return result
+
+
+def worker_session_metadata(
+    args: argparse.Namespace,
+    retailer: str,
+    *,
+    headed: bool = False,
+    url: Optional[str] = None,
+) -> dict[str, Any]:
+    ensure_worker_running()
+    state = ensure_retailer_state(args, retailer)
+    payload = request_worker(
+        "ensure_session",
+        {
+            "session": retailer_session(retailer),
+            "url": url or retailer_url(retailer),
+            "headed": headed,
+            "storage_state_path": str(storage_state_path(state, retailer)),
+        },
+    )
+    if not isinstance(payload, dict):
+        raise WorkerUnavailable("Unexpected ensure-session payload.")
+    return payload
+
+
+def worker_goto(
+    args: argparse.Namespace,
+    retailer: str,
+    url: str,
+    *,
+    headed: bool = False,
+) -> dict[str, Any]:
+    worker_session_metadata(args, retailer, headed=headed, url=retailer_url(retailer))
+    payload = request_worker("goto", {"session": retailer_session(retailer), "url": url})
+    if not isinstance(payload, dict):
+        raise WorkerUnavailable("Unexpected goto payload.")
+    return payload
+
+
+def worker_eval_result(
+    args: argparse.Namespace,
+    retailer: str,
+    expression: str,
+    *,
+    headed: bool = False,
+    open_url: Optional[str] = None,
+    goto_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    worker_session_metadata(
+        args,
+        retailer,
+        headed=headed,
+        url=open_url or retailer_url(retailer),
+    )
+    if goto_url is not None:
+        worker_goto(args, retailer, goto_url, headed=headed)
+    payload = request_worker(
+        "eval",
+        {
+            "session": retailer_session(retailer),
+            "expression": expression,
+        },
+        timeout=timeout,
+    )
+    if not isinstance(payload, dict):
+        raise WorkerUnavailable("Unexpected worker eval payload.")
+    return payload
+
+
+def worker_eval_json(
+    args: argparse.Namespace,
+    retailer: str,
+    expression: str,
+    *,
+    headed: bool = False,
+    open_url: Optional[str] = None,
+    goto_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Any:
+    return worker_eval_result(
+        args,
+        retailer,
+        expression,
+        headed=headed,
+        open_url=open_url,
+        goto_url=goto_url,
+        timeout=timeout,
+    ).get("value")
+
+
+def save_worker_storage_state(args: argparse.Namespace, retailer: str) -> Path:
+    state = ensure_retailer_state(args, retailer)
+    output = storage_state_path(state, retailer)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_worker_running()
+    payload = request_worker(
+        "save_storage_state",
+        {
+            "session": retailer_session(retailer),
+            "path": str(output),
+        },
+    )
+    if not isinstance(payload, dict):
+        raise WorkerUnavailable("Unexpected save-state payload.")
+    return output
+
+
+def with_worker_fallback(action: str, fast: Any, fallback: Any) -> Any:
+    try:
+        return fast()
+    except WorkerUnavailable as exc:
+        print(
+            f"Worker fast path for {action} is unavailable, falling back to playwright-cli: {exc}",
+            file=sys.stderr,
+        )
+        return fallback()
 
 
 def run_playwright(
@@ -618,6 +766,13 @@ def parse_ocado_search_results(text: str) -> list[dict[str, Any]]:
     return results
 
 
+def ocado_search_url(query: str) -> str:
+    cleaned = query.strip()
+    if not cleaned:
+        raise SystemExit("Ocado search query must not be empty.")
+    return f"https://www.ocado.com/search?q={urllib.parse.quote_plus(cleaned)}"
+
+
 def parse_ocado_trolley_summary(text: str) -> dict[str, Any]:
     match = re.search(
         r"Total number of items in your trolley: (\d+)\. Trolley amount: (£[0-9]+\.[0-9]{2})",
@@ -718,6 +873,150 @@ def parse_ocado_checkout_state(text: str, metadata: dict[str, str]) -> dict[str,
     if address:
         state["delivery_address"] = address.group(1).strip()
     return state
+
+
+def worker_ocado_session_status(args: argparse.Namespace, *, headed: bool = False) -> dict[str, Any]:
+    data = worker_eval_result(
+        args,
+        "ocado",
+        """async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  await sleep(750);
+  const textOf = (node) => (node?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const bodyText = textOf(document.body);
+  const links = Array.from(document.querySelectorAll('a, button'));
+  const welcomeHeading = Array.from(document.querySelectorAll('h1')).find((node) => /^Welcome,/i.test(textOf(node)));
+  const myOcado = links.find((node) => /my ocado/i.test(textOf(node)));
+  const loginVisible = links.some((node) => /log in|sign in/i.test(textOf(node)));
+  const nextSlotMatch = bodyText.match(/Next available slot:\\s*([^\\n]+)/i);
+  const basketMatch = bodyText.match(/Total number of items in your trolley:\\s*(\\d+)\\.\\s*Trolley amount:\\s*(£[0-9]+\\.[0-9]{2})/i);
+  const welcomeMatch = textOf(welcomeHeading).match(/^Welcome,\\s*(.+)$/i);
+  return {
+    logged_in: Boolean(myOcado) || Boolean(welcomeHeading) || !loginVisible,
+    customer_name: welcomeMatch ? welcomeMatch[1].trim() : null,
+    next_available_slot: nextSlotMatch ? nextSlotMatch[1].trim() : null,
+    basket: basketMatch ? { item_count: Number(basketMatch[1]), amount: basketMatch[2] } : {},
+  };
+}""",
+        headed=headed,
+        goto_url=retailer_url("ocado"),
+        timeout=20.0,
+    )
+    value = data.get("value")
+    if not isinstance(value, dict):
+        raise WorkerUnavailable("Unexpected Ocado session payload.")
+    value["page_url"] = data.get("page_url")
+    value["page_title"] = data.get("page_title")
+    return value
+
+
+def worker_ocado_search(args: argparse.Namespace, query: str, *, headed: bool = False) -> list[dict[str, Any]]:
+    expression = f"""async () => {{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const textOf = (node) => (node?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const expectedQuery = {json.dumps(query.strip().casefold())};
+  const expectedPath = '/search';
+  let matchedSearchPage = false;
+  for (let i = 0; i < 40; i += 1) {{
+    await sleep(250);
+    if (location.pathname === expectedPath) {{
+      const searchParams = new URLSearchParams(location.search);
+      const currentQuery = (searchParams.get('q') || '').trim().toLowerCase();
+      if (currentQuery === expectedQuery) {{
+        matchedSearchPage = true;
+        break;
+      }}
+    }}
+  }}
+  if (!matchedSearchPage) {{
+    throw new Error(`Ocado search did not reach a query-specific results page for "${{expectedQuery}}"`);
+  }}
+  for (let i = 0; i < 40; i += 1) {{
+    await sleep(250);
+    const addButtons = Array.from(document.querySelectorAll('button')).filter((node) =>
+      /^Add .+ to trolley$/i.test(node.getAttribute('aria-label') || textOf(node))
+    );
+    if (addButtons.length > 0) {{
+      break;
+    }}
+  }}
+  const results = [];
+  const seen = new Set();
+  const addButtons = Array.from(document.querySelectorAll('button')).filter((node) =>
+    /^Add .+ to trolley$/i.test(node.getAttribute('aria-label') || textOf(node))
+  );
+  for (const button of addButtons) {{
+    const aria = button.getAttribute('aria-label') || textOf(button);
+    const name = aria.replace(/^Add\\s+/i, '').replace(/\\s+to trolley$/i, '').trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const scope = button.closest('article, li, div') || button.parentElement || document.body;
+    const scopeText = textOf(scope);
+    const priceMatch = scopeText.match(/£\\d+\\.\\d{{2}}/);
+    const productLink = scope.querySelector('a[href*="/products/"]');
+    results.push({{
+      name,
+      add_ref: aria,
+      add_label: aria,
+      price: priceMatch ? priceMatch[0] : null,
+      url: productLink ? productLink.href : null,
+    }});
+  }}
+  return results;
+}}"""
+    result = worker_eval_json(
+        args,
+        "ocado",
+        expression,
+        headed=headed,
+        goto_url=ocado_search_url(query),
+        timeout=30.0,
+    )
+    if not isinstance(result, list) or not result:
+        raise SystemExit(f"No Ocado add-to-trolley results found for query {query!r}.")
+    return [item for item in result if isinstance(item, dict)]
+
+
+def worker_ocado_add_selected(
+    args: argparse.Namespace,
+    *,
+    add_label: str,
+    quantity: int,
+    headed: bool = False,
+) -> dict[str, Any]:
+    expression = f"""async () => {{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const target = {json.dumps(add_label)};
+  const quantity = {int(quantity)};
+  const bodyText = () => (document.body?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const button = Array.from(document.querySelectorAll('button')).find((node) => (node.getAttribute('aria-label') || '') === target);
+  if (!button) {{
+    return {{ clicked: false, reason: 'add button not found' }};
+  }}
+  for (let i = 0; i < quantity; i += 1) {{
+    button.click();
+    await sleep(850);
+  }}
+  const match = bodyText().match(/Total number of items in your trolley:\\s*(\\d+)\\.\\s*Trolley amount:\\s*(£[0-9]+\\.[0-9]{{2}})/i);
+  return {{
+    clicked: true,
+    basket: match ? {{ item_count: Number(match[1]), amount: match[2] }} : {{}},
+  }};
+}}"""
+    result = worker_eval_json(args, "ocado", expression, headed=headed)
+    if not isinstance(result, dict):
+        raise WorkerUnavailable("Unexpected Ocado add payload.")
+    return result
+
+
+def worker_ocado_basket_show(args: argparse.Namespace, *, headed: bool = False) -> dict[str, Any]:
+    status = worker_ocado_session_status(args, headed=headed)
+    basket = status.get("basket")
+    if not isinstance(basket, dict):
+        raise WorkerUnavailable("Unexpected Ocado basket payload.")
+    return basket
 
 
 def normalise_slot_token(value: str) -> str:
@@ -935,21 +1234,9 @@ def ocado_search(args: argparse.Namespace, query: str, *, headed: bool = False) 
     ensure_ocado_open(args, headed=headed)
     load_ocado_storage_state_if_present(args)
     accept_ocado_cookies_if_present(args)
-    snapshot = snapshot_path_for_session(args, OCADO_SESSION)
-    text = parse_snapshot_text(snapshot)
-    search_ref, button_ref = search_controls_from_snapshot(text)
-    run_playwright_or_exit(
-        build_session_pwcli_command(args, OCADO_SESSION) + ["fill", search_ref, query],
-        capture_output=True,
-        echo=False,
-    )
-    output = run_playwright_or_exit(
-        build_session_pwcli_command(args, OCADO_SESSION) + ["click", button_ref],
-        capture_output=True,
-        echo=False,
-    )
-    search_snapshot = latest_snapshot_path_from_output(output)
-    results = parse_ocado_search_results(parse_snapshot_text(search_snapshot))
+    search_snapshot, _ = goto_and_snapshot(args, OCADO_SESSION, ocado_search_url(query))
+    search_text = parse_snapshot_text(search_snapshot)
+    results = parse_ocado_search_results(search_text)
     if not results:
         raise SystemExit(f"No Ocado add-to-trolley results found for query {query!r}.")
     return results
@@ -1032,12 +1319,33 @@ def cmd_playwright_passthrough(args: argparse.Namespace) -> None:
 
 
 def cmd_ocado_open(args: argparse.Namespace) -> None:
-    ensure_ocado_open(args, headed=args.headed)
-    load_ocado_storage_state_if_present(args)
-    accept_ocado_cookies_if_present(args)
+    def fast() -> None:
+        worker_session_metadata(args, "ocado", headed=args.headed, url=retailer_url("ocado"))
+
+    with_worker_fallback("ocado open", fast, lambda: (
+        ensure_ocado_open(args, headed=args.headed),
+        load_ocado_storage_state_if_present(args),
+        accept_ocado_cookies_if_present(args),
+    ))
 
 
 def cmd_ocado_login(args: argparse.Namespace) -> None:
+    def fast() -> None:
+        worker_session_metadata(args, "ocado", headed=True, url=retailer_url("ocado"))
+        print("Complete the Ocado login in the headed browser, then press Enter here to save the session.")
+        try:
+            input()
+        except EOFError:
+            raise SystemExit(
+                "Login flow needs an interactive terminal. Run this command directly in your shell."
+            ) from None
+        output = save_worker_storage_state(args, "ocado")
+        print(f"Saved Ocado storage state to {output}")
+
+    with_worker_fallback("ocado login", fast, lambda: _cmd_ocado_login_legacy(args))
+
+
+def _cmd_ocado_login_legacy(args: argparse.Namespace) -> None:
     ensure_ocado_open(args, headed=True)
     had_saved_state = load_ocado_storage_state_if_present(args)
     accept_ocado_cookies_if_present(args)
@@ -1064,13 +1372,25 @@ def cmd_ocado_login(args: argparse.Namespace) -> None:
 
 
 def cmd_ocado_search(args: argparse.Namespace) -> None:
-    results = ocado_search(args, args.query, headed=args.headed)
+    results = with_worker_fallback(
+        "ocado search",
+        lambda: worker_ocado_search(args, args.query, headed=args.headed),
+        lambda: ocado_search(args, args.query, headed=args.headed),
+    )
     print(serialise(results[: args.limit]))
 
 
 def cmd_ocado_session_status(args: argparse.Namespace) -> None:
-    snapshot, metadata = load_ocado_home_snapshot(args, headed=args.headed)
-    print(serialise(parse_ocado_session_status(parse_snapshot_text(snapshot), metadata)))
+    def legacy() -> dict[str, Any]:
+        snapshot, metadata = load_ocado_home_snapshot(args, headed=args.headed)
+        return parse_ocado_session_status(parse_snapshot_text(snapshot), metadata)
+
+    status = with_worker_fallback(
+        "ocado session-status",
+        lambda: worker_ocado_session_status(args, headed=args.headed),
+        legacy,
+    )
+    print(serialise(status))
 
 
 def cmd_ocado_orders(args: argparse.Namespace) -> None:
@@ -1140,33 +1460,61 @@ def cmd_ocado_slot_book(args: argparse.Namespace) -> None:
 
 
 def cmd_ocado_add_to_basket(args: argparse.Namespace) -> None:
-    results = ocado_search(args, args.query, headed=args.headed)
-    chosen = select_ocado_result(results, args.product)
-    for _ in range(args.quantity):
-        run_playwright_or_exit(
-            build_session_pwcli_command(args, OCADO_SESSION) + ["click", chosen["add_ref"]],
-            capture_output=True,
-            echo=False,
+    def fast() -> dict[str, Any]:
+        results = worker_ocado_search(args, args.query, headed=args.headed)
+        chosen = select_ocado_result(results, args.product)
+        click_result = worker_ocado_add_selected(
+            args,
+            add_label=str(chosen.get("add_label") or chosen.get("add_ref") or ""),
+            quantity=args.quantity,
+            headed=args.headed,
         )
-    basket_snapshot = snapshot_path_for_session(args, OCADO_SESSION)
-    basket = parse_ocado_trolley_summary(parse_snapshot_text(basket_snapshot))
-    payload = {
-        "selected_product": chosen,
-        "quantity_added": args.quantity,
-        "basket": basket,
-    }
-    print(serialise(payload))
+        if not click_result.get("clicked"):
+            raise SystemExit(f"Ocado add-to-basket failed: {click_result.get('reason', 'unknown error')}")
+        return {
+            "selected_product": chosen,
+            "quantity_added": args.quantity,
+            "basket": click_result.get("basket", {}),
+        }
+
+    def legacy() -> dict[str, Any]:
+        results = ocado_search(args, args.query, headed=args.headed)
+        chosen = select_ocado_result(results, args.product)
+        for _ in range(args.quantity):
+            run_playwright_or_exit(
+                build_session_pwcli_command(args, OCADO_SESSION) + ["click", chosen["add_ref"]],
+                capture_output=True,
+                echo=False,
+            )
+        basket_snapshot = snapshot_path_for_session(args, OCADO_SESSION)
+        basket = parse_ocado_trolley_summary(parse_snapshot_text(basket_snapshot))
+        return {
+            "selected_product": chosen,
+            "quantity_added": args.quantity,
+            "basket": basket,
+        }
+
+    print(serialise(with_worker_fallback("ocado add-to-basket", fast, legacy)))
 
 
 def cmd_ocado_basket_show(args: argparse.Namespace) -> None:
-    ensure_ocado_open(args, headed=args.headed)
-    load_ocado_storage_state_if_present(args)
-    accept_ocado_cookies_if_present(args)
-    snapshot = snapshot_path_for_session(args, OCADO_SESSION)
-    basket = parse_ocado_trolley_summary(parse_snapshot_text(snapshot))
-    if not basket:
-        raise SystemExit("Could not parse the Ocado trolley summary from the current page.")
-    print(serialise(basket))
+    def fast() -> dict[str, Any]:
+        basket = worker_ocado_basket_show(args, headed=args.headed)
+        if not basket:
+            raise SystemExit("Could not parse the Ocado trolley summary from the current page.")
+        return basket
+
+    def legacy() -> dict[str, Any]:
+        ensure_ocado_open(args, headed=args.headed)
+        load_ocado_storage_state_if_present(args)
+        accept_ocado_cookies_if_present(args)
+        snapshot = snapshot_path_for_session(args, OCADO_SESSION)
+        basket = parse_ocado_trolley_summary(parse_snapshot_text(snapshot))
+        if not basket:
+            raise SystemExit("Could not parse the Ocado trolley summary from the current page.")
+        return basket
+
+    print(serialise(with_worker_fallback("ocado basket-show", fast, legacy)))
 
 
 def accept_sainsburys_cookies_if_present(args: argparse.Namespace) -> None:
@@ -1400,6 +1748,57 @@ def sainsburys_page_state(args: argparse.Namespace) -> dict[str, Any]:
     return data
 
 
+def worker_sainsburys_page_state(args: argparse.Namespace, *, headed: bool = False) -> dict[str, Any]:
+    result = worker_eval_result(
+        args,
+        "sainsburys",
+        """async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  await sleep(1500);
+  const textOf = (node) => (node?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const bodyText = textOf(document.body);
+  const links = Array.from(document.querySelectorAll('a, button'));
+  const loginVisible = links.some((node) => /log in|register|sign in/i.test(textOf(node)));
+  const accountNode = links.find((node) => /my account|my orders|groceries account/i.test(textOf(node)));
+  const helloNode = Array.from(document.querySelectorAll('p, span, div')).find((node) => /^Hello\\s+/i.test(textOf(node)));
+  const trolleyNode = links.find((node) => /Sub-total:|Full trolley|Trolley/i.test(textOf(node)));
+  const quantityNode = Array.from(document.querySelectorAll('button')).find((node) => /in trolley\\. Update quantity/i.test(node.getAttribute('aria-label') || ''));
+  const heading = document.querySelector('h1');
+  const addressNode = Array.from(document.querySelectorAll('button, a, p, div, span')).find(
+    (node) => /delivery|collection|address/i.test(textOf(node)) && /change|selected|home/i.test(textOf(node))
+  );
+  const amountMatch = textOf(trolleyNode).match(/Sub-total:\\s*(£[0-9]+\\.[0-9]{2})/i);
+  const trolleyAmountMatch = textOf(trolleyNode).match(/(£[0-9]+\\.[0-9]{2})/i);
+  const quantityMatch = (quantityNode?.getAttribute('aria-label') || '').match(/^(\\d+)\\s+.+\\s+in trolley/i);
+  const trolleyCountMatch = textOf(trolleyNode).match(/Trolley\\s*(\\d+)/i);
+  const bodyBasketMatch = bodyText.match(/(?:My Account|Favourites|Book a slot)?\\s*(\\d+)\\s*(£[0-9]+\\.[0-9]{2})/i);
+  const helloMatch = textOf(helloNode).match(/^Hello\\s+(.+)$/i);
+  return {
+    logged_in: Boolean(accountNode) || Boolean(helloNode) || (!loginVisible && !/Access Denied/i.test(document.title)),
+    customer_name: helloMatch ? helloMatch[1] : (accountNode ? textOf(accountNode) : null),
+    heading: heading ? textOf(heading) : null,
+    delivery_address: addressNode ? textOf(addressNode) : null,
+    basket: {
+      item_count: quantityMatch ? Number(quantityMatch[1]) : (trolleyCountMatch ? Number(trolleyCountMatch[1]) : (bodyBasketMatch ? Number(bodyBasketMatch[1]) : null)),
+      amount: amountMatch ? amountMatch[1] : (trolleyAmountMatch ? trolleyAmountMatch[1] : (bodyBasketMatch ? bodyBasketMatch[2] : null)),
+    },
+    access_denied: /Access Denied/i.test(document.title) || /Access Denied/i.test(bodyText),
+  };
+}""",
+        headed=headed,
+        goto_url=retailer_page_url("sainsburys", "home_new"),
+    )
+    value = result.get("value")
+    if not isinstance(value, dict):
+        raise WorkerUnavailable("Unexpected Sainsbury's page payload.")
+    basket = value.get("basket")
+    if isinstance(basket, dict):
+        value["basket"] = {key: item for key, item in basket.items() if item is not None}
+    value["page_url"] = result.get("page_url")
+    value["page_title"] = result.get("page_title")
+    return value
+
+
 def extract_sainsburys_orders(args: argparse.Namespace, *, headed: bool = False) -> dict[str, Any]:
     metadata = goto_sainsburys_page(args, "orders", headed=headed)
     data = eval_json(
@@ -1627,6 +2026,52 @@ def sainsburys_search(args: argparse.Namespace, query: str, *, headed: bool = Fa
     return results
 
 
+def worker_sainsburys_search(
+    args: argparse.Namespace, query: str, *, headed: bool = False
+) -> list[dict[str, Any]]:
+    search_url = "https://www.sainsburys.co.uk/gol-ui/SearchResults/" + urllib.parse.quote(
+        query.strip()
+    )
+    result = worker_eval_json(
+        args,
+        "sainsburys",
+        """async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  await sleep(1000);
+  const textOf = (node) => (node?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const addButtons = Array.from(document.querySelectorAll('button'))
+    .filter((button) => /^Add\\s+.+\\s+to trolley$/i.test(button.getAttribute('aria-label') || ''));
+  const products = [];
+  const seen = new Set();
+  for (const button of addButtons) {
+    const aria = button.getAttribute('aria-label') || '';
+    const name = aria.replace(/^Add\\s+/i, '').replace(/\\s+to trolley$/i, '').trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const scope = button.closest('article, li, div') || button.parentElement || document.body;
+    const scopeText = textOf(scope);
+    const priceMatch = scopeText.match(/£\\d+(?:\\.\\d{2})?/);
+    const link = scope.querySelector('a[href]');
+    products.push({
+      name,
+      add_index: addButtons.indexOf(button),
+      add_label: aria,
+      price: priceMatch ? priceMatch[0] : null,
+      url: link ? link.href : null,
+    });
+  }
+  return products;
+}""",
+        headed=headed,
+        goto_url=search_url,
+    )
+    if not isinstance(result, list) or not result:
+        raise SystemExit(f"No Sainsbury's add-to-trolley results found for query {query!r}.")
+    return [item for item in result if isinstance(item, dict)]
+
+
 def select_sainsburys_result(results: list[dict[str, Any]], product_name: Optional[str]) -> dict[str, Any]:
     if not product_name:
         return results[0]
@@ -1684,6 +2129,45 @@ def add_sainsburys_result_to_basket(
     return result
 
 
+def worker_add_sainsburys_result_to_basket(
+    args: argparse.Namespace,
+    add_index: int,
+    quantity: int,
+    *,
+    add_label: Optional[str] = None,
+    headed: bool = False,
+) -> dict[str, Any]:
+    expression = f"""async () => {{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const textOf = (node) => (node?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const addButtons = Array.from(document.querySelectorAll('button'))
+    .filter((button) => /^Add\\s+.+\\s+to trolley$/i.test(button.getAttribute('aria-label') || ''));
+  const button = {json.dumps(add_label)} ? addButtons.find((candidate) => (candidate.getAttribute('aria-label') || '') === {json.dumps(add_label)}) : addButtons[{int(add_index)}];
+  if (!button) {{
+    return {{clicked: false, reason: 'add button not found'}};
+  }}
+  const aria = button.getAttribute('aria-label') || '';
+  const itemName = aria.replace(/^Add\\s+/i, '').replace(/\\s+to trolley$/i, '').trim();
+  for (let i = 0; i < {int(quantity)}; i += 1) {{
+    button.click();
+    await sleep(1000);
+  }}
+  const quantityButton = Array.from(document.querySelectorAll('button')).find((candidate) => (candidate.getAttribute('aria-label') || '').includes(itemName) && /in trolley\\. Update quantity/i.test(candidate.getAttribute('aria-label') || ''));
+  const removeButton = Array.from(document.querySelectorAll('button')).find((candidate) => (candidate.getAttribute('aria-label') || '').includes(itemName) && /Remove .* from trolley/i.test(candidate.getAttribute('aria-label') || ''));
+  return {{
+    clicked: true,
+    href: location.href,
+    title: document.title,
+    verified_quantity_control: Boolean(quantityButton),
+    verified_remove_control: Boolean(removeButton),
+  }};
+}}"""
+    result = worker_eval_json(args, "sainsburys", expression, headed=headed)
+    if not isinstance(result, dict):
+        raise WorkerUnavailable("Unexpected Sainsbury's add payload.")
+    return result
+
+
 def extract_sainsburys_favourites(args: argparse.Namespace, *, headed: bool = False) -> dict[str, Any]:
     metadata = goto_sainsburys_page(args, "favourites", headed=headed)
     data = eval_json(
@@ -1733,12 +2217,38 @@ def extract_sainsburys_favourites(args: argparse.Namespace, *, headed: bool = Fa
 
 
 def cmd_sainsburys_open(args: argparse.Namespace) -> None:
-    ensure_sainsburys_open(args, headed=sainsburys_headed(args))
-    load_sainsburys_storage_state_if_present(args)
-    accept_sainsburys_cookies_if_present(args)
+    def fast() -> None:
+        worker_session_metadata(
+            args,
+            "sainsburys",
+            headed=sainsburys_headed(args),
+            url=retailer_url("sainsburys"),
+        )
+
+    with_worker_fallback("sainsburys open", fast, lambda: (
+        ensure_sainsburys_open(args, headed=sainsburys_headed(args)),
+        load_sainsburys_storage_state_if_present(args),
+        accept_sainsburys_cookies_if_present(args),
+    ))
 
 
 def cmd_sainsburys_login(args: argparse.Namespace) -> None:
+    def fast() -> None:
+        worker_session_metadata(args, "sainsburys", headed=True, url=retailer_url("sainsburys"))
+        print("Complete the Sainsbury's login in the headed browser, then press Enter here to save the session.")
+        try:
+            input()
+        except EOFError:
+            raise SystemExit(
+                "Login flow needs an interactive terminal. Run this command directly in your shell."
+            ) from None
+        output = save_worker_storage_state(args, "sainsburys")
+        print(f"Saved Sainsbury's storage state to {output}")
+
+    with_worker_fallback("sainsburys login", fast, lambda: _cmd_sainsburys_login_legacy(args))
+
+
+def _cmd_sainsburys_login_legacy(args: argparse.Namespace) -> None:
     ensure_sainsburys_open(args, headed=True)
     had_saved_state = load_sainsburys_storage_state_if_present(args)
     accept_sainsburys_cookies_if_present(args)
@@ -1756,8 +2266,17 @@ def cmd_sainsburys_login(args: argparse.Namespace) -> None:
 
 
 def cmd_sainsburys_session_status(args: argparse.Namespace) -> None:
+    status = with_worker_fallback(
+        "sainsburys session-status",
+        lambda: worker_sainsburys_page_state(args, headed=sainsburys_headed(args)),
+        lambda: _sainsburys_session_status_legacy(args),
+    )
+    print(serialise(status))
+
+
+def _sainsburys_session_status_legacy(args: argparse.Namespace) -> dict[str, Any]:
     goto_sainsburys_page(args, "home", headed=sainsburys_headed(args))
-    print(serialise(sainsburys_page_state(args)))
+    return sainsburys_page_state(args)
 
 
 def cmd_sainsburys_orders(args: argparse.Namespace) -> None:
@@ -1822,47 +2341,83 @@ def cmd_sainsburys_slot_book(args: argparse.Namespace) -> None:
 
 
 def cmd_sainsburys_search(args: argparse.Namespace) -> None:
-    results = sainsburys_search(args, args.query, headed=sainsburys_headed(args))
+    results = with_worker_fallback(
+        "sainsburys search",
+        lambda: worker_sainsburys_search(args, args.query, headed=sainsburys_headed(args)),
+        lambda: sainsburys_search(args, args.query, headed=sainsburys_headed(args)),
+    )
     print(serialise(results[: args.limit]))
 
 
 def cmd_sainsburys_add_to_basket(args: argparse.Namespace) -> None:
-    page_info = sainsburys_current_page_info(args)
-    current_href = str(page_info.get("href") or "")
-    expected_suffix = "/gol-ui/SearchResults/" + urllib.parse.quote(args.query.strip())
-    if current_href.endswith(expected_suffix):
-        results = extract_sainsburys_search_results(args)
-    else:
-        results = sainsburys_search(args, args.query, headed=sainsburys_headed(args))
-    chosen = select_sainsburys_result(results, args.product)
-    click_result = add_sainsburys_result_to_basket(
-        args,
-        int(chosen["add_index"]),
-        args.quantity,
-        add_label=str(chosen.get("add_label") or ""),
-    )
-    if not click_result.get("clicked"):
-        raise SystemExit(
-            f"Sainsbury's add-to-basket failed: {click_result.get('reason', 'unknown error')}"
+    def fast() -> dict[str, Any]:
+        results = worker_sainsburys_search(args, args.query, headed=sainsburys_headed(args))
+        chosen = select_sainsburys_result(results, args.product)
+        click_result = worker_add_sainsburys_result_to_basket(
+            args,
+            int(chosen["add_index"]),
+            args.quantity,
+            add_label=str(chosen.get("add_label") or ""),
+            headed=sainsburys_headed(args),
         )
-    basket_state = sainsburys_page_state(args)
-    payload = {
-        "selected_product": chosen,
-        "quantity_added": args.quantity,
-        "basket": basket_state.get("basket", {}),
-    }
-    print(serialise(payload))
+        if not click_result.get("clicked"):
+            raise SystemExit(
+                f"Sainsbury's add-to-basket failed: {click_result.get('reason', 'unknown error')}"
+            )
+        basket_state = worker_sainsburys_page_state(args, headed=sainsburys_headed(args))
+        return {
+            "selected_product": chosen,
+            "quantity_added": args.quantity,
+            "basket": basket_state.get("basket", {}),
+        }
+
+    def legacy() -> dict[str, Any]:
+        page_info = sainsburys_current_page_info(args)
+        current_href = str(page_info.get("href") or "")
+        expected_suffix = "/gol-ui/SearchResults/" + urllib.parse.quote(args.query.strip())
+        if current_href.endswith(expected_suffix):
+            results = extract_sainsburys_search_results(args)
+        else:
+            results = sainsburys_search(args, args.query, headed=sainsburys_headed(args))
+        chosen = select_sainsburys_result(results, args.product)
+        click_result = add_sainsburys_result_to_basket(
+            args,
+            int(chosen["add_index"]),
+            args.quantity,
+            add_label=str(chosen.get("add_label") or ""),
+        )
+        if not click_result.get("clicked"):
+            raise SystemExit(
+                f"Sainsbury's add-to-basket failed: {click_result.get('reason', 'unknown error')}"
+            )
+        basket_state = sainsburys_page_state(args)
+        return {
+            "selected_product": chosen,
+            "quantity_added": args.quantity,
+            "basket": basket_state.get("basket", {}),
+        }
+
+    print(serialise(with_worker_fallback("sainsburys add-to-basket", fast, legacy)))
 
 
 def cmd_sainsburys_basket_show(args: argparse.Namespace) -> None:
-    goto_sainsburys_page(args, "home", headed=sainsburys_headed(args))
-    snapshot = snapshot_path_for_session(args, SAINSBURYS_SESSION)
-    basket = sainsburys_basket_from_text(parse_snapshot_text(snapshot))
-    if not basket:
-        basket = sainsburys_page_state(args).get("basket", {})
-    if not basket:
-        raise SystemExit("Could not parse the Sainsbury's trolley summary from the current page.")
-    print(serialise(basket))
+    def fast() -> dict[str, Any]:
+        basket = worker_sainsburys_page_state(args, headed=sainsburys_headed(args)).get("basket", {})
+        if not basket:
+            raise SystemExit("Could not parse the Sainsbury's trolley summary from the current page.")
+        return basket
+
+    def legacy() -> dict[str, Any]:
+        goto_sainsburys_page(args, "home", headed=sainsburys_headed(args))
+        snapshot = snapshot_path_for_session(args, SAINSBURYS_SESSION)
+        basket = sainsburys_basket_from_text(parse_snapshot_text(snapshot))
+        if not basket:
+            basket = sainsburys_page_state(args).get("basket", {})
+        if not basket:
+            raise SystemExit("Could not parse the Sainsbury's trolley summary from the current page.")
+        return basket
+
+    print(serialise(with_worker_fallback("sainsburys basket-show", fast, legacy)))
 
 
 def cmd_sainsburys_favourites(args: argparse.Namespace) -> None:
@@ -1892,6 +2447,22 @@ def cmd_sainsburys_favourites(args: argparse.Namespace) -> None:
             }
         )
     )
+
+
+def cmd_worker_status(args: argparse.Namespace) -> None:
+    del args
+    print(serialise(worker_status_payload()))
+
+
+def cmd_worker_start(args: argparse.Namespace) -> None:
+    del args
+    ensure_worker_running()
+    print(serialise(worker_status_payload()))
+
+
+def cmd_worker_stop(args: argparse.Namespace) -> None:
+    del args
+    print(serialise(stop_worker()))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1973,6 +2544,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_ocado.add_argument("csv_path", help="Path to the exported Ocado favourites CSV")
     import_ocado.set_defaults(func=cmd_import_ocado_favourites)
+
+    worker = subparsers.add_parser("worker", help="Manage the long-lived Playwright worker")
+    worker_subparsers = worker.add_subparsers(dest="worker_command")
+
+    worker_start = worker_subparsers.add_parser("start", help="Start the worker process")
+    worker_start.set_defaults(func=cmd_worker_start)
+
+    worker_status = worker_subparsers.add_parser("status", help="Show worker process status")
+    worker_status.set_defaults(func=cmd_worker_status)
+
+    worker_stop = worker_subparsers.add_parser("stop", help="Stop the worker process")
+    worker_stop.set_defaults(func=cmd_worker_stop)
 
     playwright = subparsers.add_parser(
         "playwright", help="Run Playwright session helpers for retailer exploration"
@@ -2187,8 +2770,8 @@ def main() -> None:
     if args.func is None:
         parser.print_help()
         return
-    if getattr(args, "command", None) == "sainsburys":
-        with RetailerSessionLock("sainsburys"):
+    if getattr(args, "command", None) in {"ocado", "sainsburys"}:
+        with RetailerSessionLock(str(getattr(args, "command"))):
             args.func(args)
         return
     args.func(args)
